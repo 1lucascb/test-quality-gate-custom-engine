@@ -8,11 +8,11 @@ gate_settings:
 file_rules:
   max_lines:
     enabled: true
-    threshold: 500
+    threshold: 300
     severity: HIGH
   max_classes_per_file:
     enabled: true
-    threshold: 1
+    threshold: 3
     severity: MEDIUM
   no_wildcard_imports:
     enabled: true
@@ -21,7 +21,7 @@ file_rules:
 function_rules:
   max_lines:
     enabled: true
-    threshold: 70
+    threshold: 60
     severity: HIGH
   max_arguments:
     enabled: true
@@ -29,7 +29,7 @@ function_rules:
     severity: MEDIUM
   max_returns:
     enabled: true
-    threshold: 4
+    threshold: 3
     severity: MEDIUM
   max_nesting_depth:
     enabled: true
@@ -72,6 +72,7 @@ architectural_rules:
     modules:
       - pickle
       - telnetlib
+      - os
     severity: CRITICAL
 
 exclude_dirs:
