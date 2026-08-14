@@ -35,7 +35,6 @@ jobs:
       # 3. Execute the Custom AST Quality Engine
       - name: Execute Quality Engine
         id: engine
-        continue-on-error: true # Continue so we can post the PR comment before failing
         run: |
           python scripts/quality_engine.py
           echo "ENGINE_EXIT=$?" >> $GITHUB_ENV
