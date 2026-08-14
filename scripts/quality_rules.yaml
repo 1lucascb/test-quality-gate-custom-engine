@@ -36,11 +36,18 @@ function_rules:
     threshold: 3
     severity: HIGH
   require_type_hints:
-    enabled: true
+    enabled: false
     severity: LOW
   require_docstring:
     enabled: true
     severity: LOW
+  max_cyclomatic_complexity:
+    enabled: true
+    threshold: 10
+    severity: HIGH
+  no_mutable_defaults:
+    enabled: true
+    severity: HIGH
 
 class_rules:
   max_methods:

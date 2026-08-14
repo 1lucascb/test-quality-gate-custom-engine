@@ -20,6 +20,39 @@ class GranularASTVisitor(ast.NodeVisitor):
     # --------------------------------------------------------------------------
     # IMPORTS & ARCHITECTURE CHECKS
     # --------------------------------------------------------------------------
+
+    def _calculate_complexity(self, node: ast.AST) -> int:
+        """Calculates Cyclomatic Complexity of a function AST node."""
+        complexity = 1  # Base complexity for any function
+
+        # AST nodes that introduce new execution paths
+        branch_nodes = (
+            ast.If,
+            ast.For,
+            ast.While,
+            ast.ExceptHandler,
+            ast.With,
+            ast.Assert,
+        )
+
+        for child in ast.walk(node):
+            # 1. Branching control statements
+            if isinstance(child, branch_nodes):
+                complexity += 1
+
+            # 2. Boolean operators (e.g., `if a and b:` adds 2 decision paths)
+            elif isinstance(child, ast.BoolOp):
+                complexity += len(child.values) - 1
+
+            # 3. Comprehensions with filtering `if` conditions
+            elif isinstance(
+                child, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            ):
+                for gen in child.generators:
+                    complexity += len(gen.ifs)
+
+        return complexity
+
     def visit_Import(self, node: ast.Import):
         self._check_forbidden_imports([alias.name for alias in node.names], node.lineno)
         self.generic_visit(node)
@@ -149,6 +182,62 @@ class GranularASTVisitor(ast.NodeVisitor):
                     "line": node.lineno,
                     "message": f"Nesting depth is {max_depth} (max allowed: {rule['threshold']})"
                 })
+
+        # Rule: Cyclomatic Complexity
+        if func_cfg.get("max_cyclomatic_complexity", {}).get("enabled", False):
+            rule = func_cfg["max_cyclomatic_complexity"]
+            complexity = self._calculate_complexity(node)
+
+            if complexity > rule["threshold"]:
+                self.violations.append(
+                    {
+                        "rule": "HIGH_CYCLOMATIC_COMPLEXITY",
+                        "severity": rule.get("severity", "HIGH"),
+                        "target": f"Function '{node.name}'",
+                        "line": node.lineno,
+                        "message": (
+                            f"Function '{node.name}' has a cyclomatic complexity of {complexity} "
+                            f"(max allowed: {rule['threshold']}). Consider refactoring into smaller helper functions."
+                        ),
+                    }
+                )
+
+        if func_cfg.get("no_mutable_defaults", {}).get("enabled", False):
+            rule = func_cfg["no_mutable_defaults"]
+
+            # Combine positional defaults and keyword-only defaults
+            all_defaults = node.args.defaults + node.args.kw_defaults
+
+            for default in all_defaults:
+                if default is None:
+                    continue
+
+                # 1. Direct mutable literals: [], {}, {1, 2}
+                is_mutable_literal = isinstance(
+                    default, (ast.List, ast.Dict, ast.Set)
+                )
+
+                # 2. Constructor calls: list(), dict(), set()
+                is_mutable_call = (
+                    isinstance(default, ast.Call)
+                    and isinstance(default.func, ast.Name)
+                    and default.func.id in {"list", "dict", "set"}
+                )
+
+                if is_mutable_literal or is_mutable_call:
+                    self.violations.append(
+                        {
+                            "rule": "MUTABLE_DEFAULT_ARGUMENT",
+                            "severity": rule.get("severity", "HIGH"),
+                            "target": f"Function '{node.name}'",
+                            "line": default.lineno,
+                            "message": (
+                                f"Function '{node.name}' uses a mutable default argument. "
+                                "Default mutable objects persist across function calls! "
+                                "Use 'None' as the default value and initialize inside the function body instead."
+                            ),
+                        }
+                    )
 
     def _calculate_max_nesting(self, node: ast.AST, current_depth: int = 0) -> int:
         nested_blocks = (ast.If, ast.For, ast.While, ast.With, ast.Try)
@@ -357,36 +446,151 @@ def run_engine(config_path: str = "scripts/quality_rules.yaml", target_dir: str 
     return results
 
 
+# def export_reports(data: Dict[str, Any]):
+#     Path("quality_report.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+#     status = data["summary"]["status"]
+#     status_icon = "✅ PASSED" if status == "PASSED" else ("⚠️ PASSED (Warnings)" if status == "PASSED_WITH_WARNINGS" else "❌ FAILED")
+
+#     md_lines = [
+#         "### 📐 Granular Quality Engine Report",
+#         "",
+#         f"**Status:** {status_icon} | **Files Scanned:** `{data['summary']['files_scanned']}` | **Blocking Failures:** `{data['summary']['blocking_violations']}` | **Total Warnings:** `{data['summary']['total_violations']}`",
+#         "",
+#         "| File | Line | Rule | Severity | Details |",
+#         "| :--- | :---: | :--- | :---: | :--- |"
+#     ]
+
+#     if not data["files"]:
+#         md_lines.append("| _All files_ | — | _Clean Code_ | 🟢 INFO | All granular quality rules satisfied! |")
+#     else:
+#         severity_icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
+#         for file_entry in data["files"]:
+#             file_name = file_entry["file"]
+#             for v in file_entry["violations"]:
+#                 icon = severity_icons.get(v["severity"], "⚪")
+#                 md_lines.append(
+#                     f"| `{file_name}` | `{v['line']}` | `{v['rule']}` | {icon} {v['severity']} | {v['message']} |"
+#                 )
+
+#     md_lines.extend(["", "*Generated by `scripts/quality_engine.py`*"])
+#     Path("quality_summary.md").write_text("\n".join(md_lines), encoding="utf-8")
+
 def export_reports(data: Dict[str, Any]):
+    # Save raw JSON audit artifact
     Path("quality_report.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-    status = data["summary"]["status"]
-    status_icon = "✅ PASSED" if status == "PASSED" else ("⚠️ PASSED (Warnings)" if status == "PASSED_WITH_WARNINGS" else "❌ FAILED")
+    summary = data.get("summary", {})
+    status = summary.get("status", "PASSED")
+    
+    # Calculate severity & rule distributions
+    sev_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    rule_counts: Dict[str, int] = {}
+    
+    for f in data.get("files", []):
+        for v in f.get("violations", []):
+            sev = v.get("severity", "LOW")
+            sev_counts[sev] = sev_counts.get(sev, 0) + 1
+            
+            rule = v.get("rule", "UNKNOWN")
+            rule_counts[rule] = rule_counts.get(rule, 0) + 1
 
-    md_lines = [
-        "### 📐 Granular Quality Engine Report",
+    # Map status to enterprise badges
+    status_badge = {
+        "PASSED": "🟢 **PASSED (GATE SUCCESS)**",
+        "PASSED_WITH_WARNINGS": "🟡 **PASSED WITH WARNINGS**",
+        "FAILED": "🔴 **FAILED (GATE BLOCKED)**"
+    }.get(status, "⚪ **UNKNOWN**")
+
+    md = [
+        "# 🛡️ Enterprise Static Analysis & Security Report",
+        "---",
+        "## 📌 Executive Summary",
         "",
-        f"**Status:** {status_icon} | **Files Scanned:** `{data['summary']['files_scanned']}` | **Blocking Failures:** `{data['summary']['blocking_violations']}` | **Total Warnings:** `{data['summary']['total_violations']}`",
+        "| Metric | Result |",
+        "| :--- | :--- |",
+        f"| **Quality Gate Status** | {status_badge} |",
+        f"| **Files Analyzed** | `{summary.get('files_scanned', 0)}` |",
+        f"| **Total Violations** | `{summary.get('total_violations', 0)}` |",
+        f"| **Blocking Violations** | `{summary.get('blocking_violations', 0)}` |",
         "",
-        "| File | Line | Rule | Severity | Details |",
-        "| :--- | :---: | :--- | :---: | :--- |"
+        "### 📊 Violation Severity Matrix",
+        "",
+        "| 🔴 Critical | 🟠 High | 🟡 Medium | 🔵 Low |",
+        "| :---: | :---: | :---: | :---: |",
+        f"| **{sev_counts['CRITICAL']}** | **{sev_counts['HIGH']}** | **{sev_counts['MEDIUM']}** | **{sev_counts['LOW']}** |",
+        ""
     ]
 
-    if not data["files"]:
-        md_lines.append("| _All files_ | — | _Clean Code_ | 🟢 INFO | All granular quality rules satisfied! |")
+    # Rule Distribution Section
+    if rule_counts:
+        md.extend([
+            "### 📈 Top Triggered Rules",
+            "",
+            "| Rule Identifier | Occurrences | Impact Level |",
+            "| :--- | :---: | :---: |"
+        ])
+        sorted_rules = sorted(rule_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        for rule_id, count in sorted_rules:
+            md.append(f"| `{rule_id}` | `{count}` | Dynamic Policy |")
+        md.append("")
+
+    # Detailed Findings Section
+    md.extend([
+        "---",
+        "## 🔍 Detailed Findings & Code Audit",
+        ""
+    ])
+
+    if not data.get("files"):
+        md.append("> ✅ **Clean Codebase**: Zero static security or quality violations detected across scanned targets.")
     else:
         severity_icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
+        
+        md.extend([
+            "| Location | Rule | Severity | Message & Guidance |",
+            "| :--- | :--- | :---: | :--- |"
+        ])
+        
         for file_entry in data["files"]:
             file_name = file_entry["file"]
             for v in file_entry["violations"]:
                 icon = severity_icons.get(v["severity"], "⚪")
-                md_lines.append(
-                    f"| `{file_name}` | `{v['line']}` | `{v['rule']}` | {icon} {v['severity']} | {v['message']} |"
+                location = f"`{file_name}:{v['line']}`"
+                md.append(
+                    f"| {location} | `{v['rule']}` | {icon} **{v['severity']}** | {v['message']} |"
                 )
 
-    md_lines.extend(["", "*Generated by `scripts/quality_engine.py`*"])
-    Path("quality_summary.md").write_text("\n".join(md_lines), encoding="utf-8")
+    # Compliance & CI/CD Gate Policy
+    md.extend([
+        "",
+        "---",
+        "## 🚨 Governance & Security Gate Policy",
+        ""
+    ])
+    
+    if status == "FAILED":
+        md.append(
+            "> ❌ **DEPLOYMENT BLOCKED**: The analysis identified blocking severity violations (`CRITICAL` / `HIGH`). "
+            "PR merge is restricted until all policy-blocking items are resolved."
+        )
+    elif status == "PASSED_WITH_WARNINGS":
+        md.append(
+            "> ⚠️ **GATE PASSED WITH WARNINGS**: Non-blocking violations (`MEDIUM` / `LOW`) were detected. "
+            "Addressing these items during the current sprint cycle is recommended."
+        )
+    else:
+        md.append(
+            "> ✅ **GATE PASSED**: All scanned targets comply with enterprise static analysis guidelines."
+        )
 
+    md.extend([
+        "",
+        "---",
+        "*Automated report generated by **Granular AST Quality & SAST Engine**.*"
+    ])
+
+    Path("quality_summary.md").write_text("\n".join(md), encoding="utf-8")
 
 if __name__ == "__main__":
     report_data = run_engine()
